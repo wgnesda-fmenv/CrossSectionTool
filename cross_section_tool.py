@@ -9,6 +9,7 @@ Author: Based on xsec_tool.py with enhanced functionality
 """
 
 import numpy as np
+import math
 import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
@@ -16,6 +17,7 @@ from matplotlib.collections import PatchCollection
 import geopandas as gpd
 from shapely.geometry import Point, LineString
 from typing import Union, List, Tuple, Optional, Dict
+
 import warnings
 
 try:
@@ -75,6 +77,7 @@ class CrossSectionTool:
         >>> xsec.plot_cross_section()
         """
         self.data = data.copy()
+        #add a check that there are no NaN values
         
         # Set up column mapping
         default_mapping = {
@@ -152,7 +155,7 @@ class CrossSectionTool:
         self.xsec_line = LineString(endpoints)
         
         print(f"Cross-section line defined: {endpoints}")
-        return endpoints
+        return endpoints #added
     
     def set_line_programmatic(self, endpoints: List[List[float]]):
         """
@@ -224,7 +227,9 @@ class CrossSectionTool:
     
     def build_cross_section(self,
                            search_distance: float,
+                           # endpoints: List[List[float]]= endpoints, #added
                            dem_path: Optional[str] = None,
+                           sample_num: Optional[int] = None, #number of points to sample dem to build ground surface profile 
                            reference_elevation: float = 0.0,
                            use_elevation: bool = True) -> pd.DataFrame:
         """
@@ -286,13 +291,43 @@ class CrossSectionTool:
         proj_df = pd.DataFrame(projections)
         filtered = pd.concat([filtered.reset_index(drop=True), proj_df], axis=1)
         
-        # Get ground surface elevations
+        # Get ground surface elevations #to fix -- sample 100 pts along the line to plot
         if dem_path and RASTERIO_AVAILABLE:
             elevations = self._sample_dem(filtered[self.columns['x_coord']].values,
                                          filtered[self.columns['y_coord']].values)
             filtered['ground_elevation'] = elevations
+
+            #get a sampled ============================================================================================
+            # elevations_plot = self._sample_dem   #sampled 100 points along the cross-section line to sample the dem
+            # elevations_dist_along_line = 
+            # endpoints = [[xs[0], ys[0]], [xs[1], ys[1]]]
+            end_coords = list(self.xsec_line.coords)
+            try:
+                xsample = np.linspace(end_coords[0][0], end_coords[1][0], num = sample_num)
+                xsec_slope = (end_coords[1][1] - end_coords[0][1]) / (end_coords[1][0] - end_coords[0][0])
+                y_intercept = end_coords[0][1] - (xsec_slope * xsample[0])
+                ysample = (xsec_slope*xsample) + y_intercept
+            
+            except: #if a straight line
+                print("using straight line exception...")
+                xsample = np.ones(sample_num)*end_coords[0][0]
+                ysample = np.linspace(end_coords[0][1], end_coords[1][1], num = sample_num)
+
+            #sample elevation
+            elevation_plot = self._sample_dem(xsample, ysample)
+            coord_list = [(x, y) for x, y in zip(xsample, ysample)]
+            elevation_dist_along_line = [math.hypot(p2[0] - p1[0], p2[1] - p1[1]) for p1, p2 in zip(coord_list, coord_list[1:])]
+            print(len(elevation_plot), len(elevation_dist_along_line)) #first needs to be zero
+            
+            self.elevation_plot = elevation_plot
+            self.elevation_dist_along_line = np.cumsum([0.0, *elevation_dist_along_line])
+            # print(self.elevation_plot, self.elevation_dist_along_line)
+            #======================================================
+            
         else:
             filtered['ground_elevation'] = reference_elevation
+            elevation_plot = []
+            elevation_dist_along_line = []
         
         # Calculate elevations for plotting
         if use_elevation:
@@ -309,7 +344,7 @@ class CrossSectionTool:
         
         print(f"Cross-section built: {len(self.xsec_data)} records from {self.xsec_data[self.columns['station_id']].nunique()} stations")
         
-        return self.xsec_data
+        return self.xsec_data, self.elevation_plot, self.elevation_dist_along_line # added
     
     def _sample_dem(self, x_coords: np.ndarray, y_coords: np.ndarray) -> np.ndarray:
         """
@@ -354,7 +389,7 @@ class CrossSectionTool:
         Parameters:
         -----------
         color_scheme : dict, optional
-            Dictionary mapping lithology descriptions to colors
+            Dictionary mapping lithology descriptions to colors - allow for random entry
             Example: {'Sand': 'yellow', 'Clay': 'brown', 'Gravel': 'gray'}
         figsize : tuple
             Figure size (width, height)
@@ -401,6 +436,7 @@ class CrossSectionTool:
             unique_descriptions = self.xsec_data[self.columns['description']].unique()
             colors = plt.cm.tab20(np.linspace(0, 1, len(unique_descriptions)))
             color_scheme = {desc: colors[i] for i, desc in enumerate(unique_descriptions)}
+            print(color_scheme) #debugging
         
         # Plot lithologic intervals or points
         if has_intervals:
@@ -410,6 +446,7 @@ class CrossSectionTool:
         
         # Plot ground surface
         if plot_ground_surface:
+            # print("why", self.elevation_plot)
             self._plot_ground_surface(ax)
         
         # Formatting
@@ -425,12 +462,9 @@ class CrossSectionTool:
         ax.set_xlim(0, self.xsec_line.length)
         
         # Add legend
-        handles = [plt.Rectangle((0,0),1,1, facecolor=color_scheme.get(desc, 'gray'), 
-                                edgecolor='black', linewidth=0.5) 
-                  for desc in sorted(color_scheme.keys())]
+        handles = [plt.Rectangle((0,0),1,1, facecolor=color_scheme.get(desc, 'gray'), edgecolor='black', linewidth=0.5) for desc in sorted(color_scheme.keys())]
         labels = sorted(color_scheme.keys())
-        ax.legend(handles, labels, loc='best', ncol=min(3, len(labels)), 
-                 fontsize=9, title='Lithology')
+        ax.legend(handles, labels, loc='best', ncol=min(3, len(labels)), fontsize=9, title='Lithology')
         
         plt.tight_layout()
         
@@ -476,15 +510,19 @@ class CrossSectionTool:
     def _plot_ground_surface(self, ax):
         """Plot the ground surface profile."""
         # Get unique stations and their ground elevations
-        station_data = self.xsec_data.groupby(self.columns['station_id']).agg({
-            'dist_along_line': 'first',
-            'ground_elevation': 'first'
-        }).sort_values('dist_along_line')
+        # station_data = self.xsec_data.groupby(self.columns['station_id']).agg({
+        #     'dist_along_line': 'first',
+        #     'ground_elevation': 'first'
+        # }).sort_values('dist_along_line')
         
-        ax.plot(station_data['dist_along_line'], 
-               station_data['ground_elevation'],
-               color='saddlebrown', linewidth=2, 
-               linestyle='-', alpha=0.7, label='Ground Surface')
+        # ax.plot(station_data['dist_along_line'], 
+        #        station_data['ground_elevation'],
+        #        color='saddlebrown', linewidth=2, 
+        #        linestyle='-', alpha=0.7, label='Ground Surface')
+        
+        # print(self.elevation_plot, self.elevation_dist_along_line)
+        #alternative plotting of sampled data along line=================================================
+        ax.plot(self.elevation_dist_along_line, self.elevation_plot, color='saddlebrown', linewidth=2, linestyle='-', alpha=0.7, label='Ground Surface')
     
     def plot_map_view(self,
                      figsize: Tuple[float, float] = (8, 8),
