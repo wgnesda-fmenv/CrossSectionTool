@@ -11,6 +11,14 @@ A comprehensive Python tool for creating geological cross-sections from borehole
 - ✅ **Data Export**: Export cross-section data to CSV, Excel, or Shapefiles
 - ✅ **Map View**: Generate accompanying map views showing section location
 
+## To dos
+ - add data validation step to ensure no data values are not present or adjusted
+ - change default bar width to 5% of cross-section length
+ - add ability to switch between x and y distances
+ - add elevation column plotting - bypass DEM ground surface and plot directly from the elevation column
+ - read or specify units
+ - annotations (location ids, other?)
+
 ## Installation
 
 ### Requirements
