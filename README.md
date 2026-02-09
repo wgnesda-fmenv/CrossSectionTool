@@ -10,7 +10,6 @@ A comprehensive Python tool for creating geological cross-sections from borehole
 - ✅ **Customizable Visualization**: Full control over colors, widths, and styling
 - ✅ **Data Export**: Export cross-section data to CSV, Excel, or Shapefiles
 - ✅ **Map View**: Generate accompanying map views showing section location
-- ✅ **Well-Documented**: Comprehensive docstrings and examples
 
 ## Installation
 
@@ -355,7 +354,7 @@ MIT License - feel free to use and modify for your projects.
 If you use this tool in research, please cite:
 ```
 CrossSectionTool - Geological Cross-Section Visualization
-https://github.com/your-repo/cross-section-tool
+https://github.com/wgnesda-fmenv/CrossSectionTool
 ```
 
 ## Contact
