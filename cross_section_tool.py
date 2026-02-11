@@ -729,6 +729,32 @@ class CrossSectionTool:
         # Set limits
         ax.set_xlim(0, self.xsec_line.length)
 
+        # Calculate and set y-axis limits based on data
+        # matplotlib doesn't auto-scale for patches, so we calculate from data
+        y_values = []
+
+        if has_intervals:
+            if (
+                "top_elevation" in self.xsec_data.columns
+                and "bottom_elevation" in self.xsec_data.columns
+            ):
+                y_values.extend(self.xsec_data["top_elevation"].values)
+                y_values.extend(self.xsec_data["bottom_elevation"].values)
+        else:
+            if "elevation" in self.xsec_data.columns:
+                y_values.extend(self.xsec_data["elevation"].values)
+
+        # Include ground surface elevations if available
+        if plot_ground_surface and len(self.elevation_plot) > 0:
+            y_values.extend(self.elevation_plot)
+
+        # Set y-limits with some padding
+        if y_values:
+            y_min = np.min(y_values)
+            y_max = np.max(y_values)
+            y_range = y_max - y_min if y_max != y_min else 10
+            ax.set_ylim(y_min - 0.05 * y_range, y_max + 0.05 * y_range)
+
         # Add legend
         handles = [
             plt.Rectangle(
