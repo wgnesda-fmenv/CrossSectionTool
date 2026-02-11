@@ -20,6 +20,9 @@ from matplotlib.collections import PatchCollection
 import geopandas as gpd
 from shapely.geometry import Point, LineString
 from typing import Union, List, Tuple, Optional, Dict
+import os
+import re
+from datetime import datetime
 
 import warnings
 
@@ -48,18 +51,24 @@ class CrossSectionTool:
         xsec_line (LineString): The cross-section line geometry
         xsec_data (pd.DataFrame): Projected data along the cross-section
         search_distance (float): Maximum distance for including points
+        bathy_folder (str): Path to folder containing dated bathymetry rasters
+        bathy_files (dict): Dictionary mapping years to bathymetry file paths
     """
 
     def __init__(
-        self, data: pd.DataFrame, column_mapping: Optional[Dict[str, str]] = None
+        self,
+        data: Union[pd.DataFrame, gpd.GeoDataFrame],
+        column_mapping: Optional[Dict[str, str]] = None,
+        bathy_folder: Optional[str] = None,
     ):
         """
         Initialize the CrossSectionTool.
 
         Parameters:
         -----------
-        data : pd.DataFrame
-            Input data with spatial coordinates and lithologic/measurement information
+        data : pd.DataFrame or gpd.GeoDataFrame
+            Input data with spatial coordinates and lithologic/measurement information.
+            If GeoDataFrame, will extract X/Y coordinates from geometry if not present.
         column_mapping : dict, optional
             Mapping of expected columns to actual column names in data.
             Default expects: {
@@ -70,8 +79,12 @@ class CrossSectionTool:
                 'bottom_depth': 'Bottom_Depth',  # For interval data
                 'depth': 'Depth',  # For point data
                 'description': 'Description',  # Lithology or measurement name
-                'value': 'Value'  # Optional numeric value for coloring
+                'value': 'Value',  # Optional numeric value for coloring
+                'sample_date': 'SampleDate'  # Sample date for bathymetry matching
             }
+        bathy_folder : str, optional
+            Path to folder containing dated bathymetry rasters (.tif files).
+            Files should have year in filename (e.g., 'bathy_2015.tif', '2020.tif')
 
         Example:
         --------
@@ -79,9 +92,27 @@ class CrossSectionTool:
         >>> xsec = CrossSectionTool(df)
         >>> xsec.set_line_interactive()
         >>> xsec.plot_cross_section()
+
+        >>> # Or with GeoDataFrame and bathymetry
+        >>> gdf = gpd.read_file('cores.shp')
+        >>> xsec = CrossSectionTool(gdf, bathy_folder='bathymetry_rasters/')
         """
-        self.data = data.copy()
-        # add a check that there are no NaN values
+        # Handle GeoDataFrame input
+        if isinstance(data, gpd.GeoDataFrame):
+            self.data = data.copy()
+            # Extract X, Y from geometry if not present in columns
+            if (
+                "X_Coord" not in self.data.columns
+                and "x_coord" not in self.data.columns
+            ):
+                self.data["X_Coord"] = self.data.geometry.x
+            if (
+                "Y_Coord" not in self.data.columns
+                and "y_coord" not in self.data.columns
+            ):
+                self.data["Y_Coord"] = self.data.geometry.y
+        else:
+            self.data = data.copy()
 
         # Set up column mapping
         default_mapping = {
@@ -93,6 +124,7 @@ class CrossSectionTool:
             "depth": "Depth",
             "description": "Description",
             "value": "Value",
+            "sample_date": "SampleDate",
         }
 
         if column_mapping:
@@ -103,7 +135,19 @@ class CrossSectionTool:
         self.xsec_data = None
         self.search_distance = None
         self.dem_path = None
+        self.bathy_folder = bathy_folder
+        self.bathy_files = {}  # Dictionary mapping year -> file path
         self.reference_elevation = 0.0
+        # Ensure elevation arrays always exist to avoid AttributeError later when plotting multiple ground surfaces...
+        self.elevation_plot = np.array([])
+        self.elevation_dist_along_line = np.array([])
+        self.ground_surfaces = (
+            {}
+        )  # Dictionary to store multiple ground surfaces by year
+
+        # If bathymetry folder provided, discover files
+        if self.bathy_folder:
+            self._discover_bathy_files()
 
     def set_line_interactive(
         self,
@@ -238,14 +282,111 @@ class CrossSectionTool:
 
         return projected_point.x, projected_point.y, projected_distance
 
+    def _discover_bathy_files(self):
+        """
+        Discover and catalog bathymetry files in the provided folder.
+
+        Expects files to have a 4-digit year in the filename
+        (e.g., 'bathy_2015.tif', '2020_bathymetry.tif', 'dem_2018.tif')
+        """
+        if self.bathy_folder is None:
+            return
+
+        if not os.path.exists(self.bathy_folder):
+            warnings.warn(f"Bathymetry folder not found: {self.bathy_folder}")
+            return
+
+        # Get all .tif files
+        try:
+            tif_files = [
+                f for f in os.listdir(self.bathy_folder) if f.lower().endswith(".tif")
+            ]
+        except Exception as e:
+            warnings.warn(f"Error reading bathymetry folder: {e}")
+            return
+
+        # Extract year from filename (4-digit pattern)
+        year_pattern = r"(\d{4})"
+
+        for filename in tif_files:
+            match = re.search(year_pattern, filename)
+            if match:
+                year = int(match.group(1))
+                # Validate year is reasonable (e.g., 1900-2100)
+                if 1900 <= year <= 2100:
+                    filepath = os.path.join(self.bathy_folder, filename)
+                    # If multiple files have same year, keep the first one found
+                    if year not in self.bathy_files:
+                        self.bathy_files[year] = filepath
+
+        if self.bathy_files:
+            years = sorted(self.bathy_files.keys())
+            print(f"Found {len(self.bathy_files)} bathymetry rasters: years {years}")
+        else:
+            warnings.warn(
+                f"No bathymetry files with year patterns found in {self.bathy_folder}"
+            )
+
+    def _get_closest_bathy_year(self, sample_date) -> Optional[int]:
+        """
+        Find the closest bathymetry year for a given sample date.
+
+        Parameters:
+        -----------
+        sample_date : datetime, str, int, or float
+            Sample date/year. Can be:
+            - Integer year (e.g., 2015)
+            - Date string (e.g., '2015-06-20', '06/20/2015')
+            - datetime object
+
+        Returns:
+        --------
+        int or None
+            Closest year with bathymetry data, or None if no bathy files
+        """
+        if not self.bathy_files:
+            return None
+
+        # Convert sample_date to year
+        sample_year = None
+
+        if pd.isna(sample_date):
+            return None
+
+        if isinstance(sample_date, (int, float)):
+            sample_year = int(sample_date)
+        elif isinstance(sample_date, str):
+            # Try to parse date string
+            try:
+                sample_year = pd.to_datetime(sample_date).year
+            except:
+                # Try to extract year from string
+                match = re.search(r"(\d{4})", sample_date)
+                if match:
+                    sample_year = int(match.group(1))
+                else:
+                    warnings.warn(f"Could not parse year from: {sample_date}")
+                    return None
+        else:
+            # Assume it's a datetime-like object
+            try:
+                sample_year = pd.to_datetime(sample_date).year
+            except:
+                warnings.warn(f"Could not extract year from: {sample_date}")
+                return None
+
+        # Find closest year
+        available_years = sorted(self.bathy_files.keys())
+        closest_year = min(available_years, key=lambda x: abs(x - sample_year))
+
+        return closest_year
+
     def build_cross_section(
         self,
         search_distance: float,
         # endpoints: List[List[float]]= endpoints, #added
         dem_path: Optional[str] = None,
-        sample_num: Optional[
-            int
-        ] = None,  # number of points to sample dem to build ground surface profile
+        sample_num: int = 100,  # number of points to sample dem to build ground surface profile
         reference_elevation: float = 0.0,
         use_elevation: bool = True,
     ) -> pd.DataFrame:
@@ -308,18 +449,49 @@ class CrossSectionTool:
         proj_df = pd.DataFrame(projections)
         filtered = pd.concat([filtered.reset_index(drop=True), proj_df], axis=1)
 
-        # Get ground surface elevations #to fix -- sample 100 pts along the line to plot
-        if dem_path and RASTERIO_AVAILABLE:
+        # Get ground surface elevations
+        # If using dated bathymetry, match each station to nearest year
+        if self.bathy_files and self.columns["sample_date"] in filtered.columns:
+            print("Using dated bathymetry rasters based on sample dates...")
+            elevations = []
+            filtered["bathy_year"] = pd.Series(
+                [None] * len(filtered), dtype="Int64"
+            )  # Track which year was used
+
+            for idx, row in filtered.iterrows():
+                sample_date = row[self.columns["sample_date"]]
+                closest_year = self._get_closest_bathy_year(sample_date)
+
+                if closest_year is not None:
+                    bathy_path = self.bathy_files[closest_year]
+                    elev = self._sample_dem(
+                        np.array([row[self.columns["x_coord"]]]),
+                        np.array([row[self.columns["y_coord"]]]),
+                        dem_path=bathy_path,
+                    )[0]
+                    filtered.loc[idx, "bathy_year"] = closest_year
+                else:
+                    elev = self.reference_elevation
+
+                elevations.append(elev)
+
+            filtered["ground_elevation"] = elevations
+
+            # Report which years were used
+            years_used = filtered["bathy_year"].dropna().unique()
+            if len(years_used) > 0:
+                print(f"Used bathymetry from years: {sorted(years_used)}")
+
+        # Otherwise use single DEM if provided
+        elif dem_path and RASTERIO_AVAILABLE:
             elevations = self._sample_dem(
-                filtered[self.columns["x_coord"]].values,
-                filtered[self.columns["y_coord"]].values,
+                np.asarray(filtered[self.columns["x_coord"]].values),
+                np.asarray(filtered[self.columns["y_coord"]].values),
+                dem_path=dem_path,
             )
             filtered["ground_elevation"] = elevations
 
-            # get a sampled ============================================================================================
-            # elevations_plot = self._sample_dem   #sampled 100 points along the cross-section line to sample the dem
-            # elevations_dist_along_line =
-            # endpoints = [[xs[0], ys[0]], [xs[1], ys[1]]]
+            # Sample elevation along the cross-section line for continuous ground surface
             end_coords = list(self.xsec_line.coords)
             try:
                 xsample = np.linspace(
@@ -331,30 +503,52 @@ class CrossSectionTool:
                 y_intercept = end_coords[0][1] - (xsec_slope * xsample[0])
                 ysample = (xsec_slope * xsample) + y_intercept
 
-            except:  # if a straight line
-                print("using straight line exception...")
+            except:  # if a vertical line
+                print("Using vertical line sampling...")
                 xsample = np.ones(sample_num) * end_coords[0][0]
                 ysample = np.linspace(
                     end_coords[0][1], end_coords[1][1], num=sample_num
                 )
 
-            # sample elevation
-            elevation_plot = self._sample_dem(xsample, ysample)
             coord_list = [(x, y) for x, y in zip(xsample, ysample)]
             elevation_dist_along_line = [
                 math.hypot(p2[0] - p1[0], p2[1] - p1[1])
                 for p1, p2 in zip(coord_list, coord_list[1:])
             ]
-            print(
-                len(elevation_plot), len(elevation_dist_along_line)
-            )  # first needs to be zero
 
-            self.elevation_plot = elevation_plot
-            self.elevation_dist_along_line = np.cumsum(
-                [0.0, *elevation_dist_along_line]
-            )
-            # print(self.elevation_plot, self.elevation_dist_along_line)
-            # ======================================================
+            # If using dated bathymetry, create ground surfaces for each unique year
+            if self.bathy_files and "bathy_year" in filtered.columns:
+                unique_years = sorted(filtered["bathy_year"].dropna().unique())
+
+                for year in unique_years:
+                    year = int(year)
+                    bathy_path = self.bathy_files[year]
+                    elevation_plot_year = self._sample_dem(
+                        xsample, ysample, dem_path=bathy_path
+                    )
+                    dist_along = np.cumsum([0.0, *elevation_dist_along_line])
+                    self.ground_surfaces[year] = {
+                        "elevation": elevation_plot_year,
+                        "distance": dist_along,
+                    }
+                    print(f"Created ground surface profile for year {year}")
+
+                # Set default to most recent year for backward compatibility
+                if unique_years:
+                    most_recent = max(unique_years)
+                    self.elevation_plot = self.ground_surfaces[int(most_recent)][
+                        "elevation"
+                    ]
+                    self.elevation_dist_along_line = self.ground_surfaces[
+                        int(most_recent)
+                    ]["distance"]
+            else:
+                # Single DEM sampling
+                elevation_plot = self._sample_dem(xsample, ysample, dem_path=dem_path)
+                self.elevation_plot = elevation_plot
+                self.elevation_dist_along_line = np.cumsum(
+                    [0.0, *elevation_dist_along_line]
+                )
 
         else:
             filtered["ground_elevation"] = reference_elevation
@@ -388,13 +582,11 @@ class CrossSectionTool:
             f"Cross-section built: {len(self.xsec_data)} records from {self.xsec_data[self.columns['station_id']].nunique()} stations"
         )
 
-        return (
-            self.xsec_data,
-            self.elevation_plot,
-            self.elevation_dist_along_line,
-        )  # added
+        return self.xsec_data
 
-    def _sample_dem(self, x_coords: np.ndarray, y_coords: np.ndarray) -> np.ndarray:
+    def _sample_dem(
+        self, x_coords: np.ndarray, y_coords: np.ndarray, dem_path: Optional[str] = None
+    ) -> np.ndarray:
         """
         Sample elevation values from a DEM raster.
 
@@ -402,6 +594,8 @@ class CrossSectionTool:
         -----------
         x_coords, y_coords : np.ndarray
             Coordinate arrays
+        dem_path : str, optional
+            Path to specific DEM file. If None, uses self.dem_path
 
         Returns:
         --------
@@ -412,13 +606,21 @@ class CrossSectionTool:
             warnings.warn("rasterio not available, using reference elevation")
             return np.full(len(x_coords), self.reference_elevation)
 
+        # Use provided path or fall back to instance path
+        path_to_use = dem_path if dem_path is not None else self.dem_path
+
+        if path_to_use is None:
+            return np.full(len(x_coords), self.reference_elevation)
+
         try:
-            with rasterio.open(self.dem_path) as src:
+            with rasterio.open(path_to_use) as src:
                 coord_list = [(x, y) for x, y in zip(x_coords, y_coords)]
                 elevations = [val[0] for val in src.sample(coord_list)]
                 return np.array(elevations)
         except Exception as e:
-            warnings.warn(f"Error reading DEM: {e}. Using reference elevation.")
+            warnings.warn(
+                f"Error reading DEM {path_to_use}: {e}. Using reference elevation."
+            )
             return np.full(len(x_coords), self.reference_elevation)
 
     def plot_cross_section(
@@ -428,6 +630,7 @@ class CrossSectionTool:
         vertical_exaggeration: float = 1.0,
         bar_width: Optional[float] = None,
         plot_ground_surface: bool = True,
+        plot_all_ground_surfaces: bool = False,
         ylabel: str = "Elevation",
         title: Optional[str] = None,
         savepath: Optional[str] = None,
@@ -448,7 +651,10 @@ class CrossSectionTool:
         bar_width : float, optional
             Width of lithology bars. If None, calculated automatically
         plot_ground_surface : bool
-            Whether to plot ground surface line
+            Whether to plot ground surface line (default: True)
+        plot_all_ground_surfaces : bool
+            If True and multiple dated bathymetry surfaces exist, plot all of them.
+            If False, only plot the most recent one (default: False)
         ylabel : str
             Y-axis label
         title : str, optional
@@ -504,10 +710,12 @@ class CrossSectionTool:
         else:
             self._plot_points(ax, color_scheme, bar_width)
 
-        # Plot ground surface
+        # Plot ground surface(s)
         if plot_ground_surface:
-            # print("why", self.elevation_plot)
-            self._plot_ground_surface(ax)
+            if plot_all_ground_surfaces and self.ground_surfaces:
+                self._plot_all_ground_surfaces(ax)
+            else:
+                self._plot_ground_surface(ax)
 
         # Formatting
         ax.set_xlabel("Distance Along Section (units)", fontsize=11)
@@ -597,29 +805,41 @@ class CrossSectionTool:
             )
 
     def _plot_ground_surface(self, ax):
-        """Plot the ground surface profile."""
-        # Get unique stations and their ground elevations
-        # station_data = self.xsec_data.groupby(self.columns['station_id']).agg({
-        #     'dist_along_line': 'first',
-        #     'ground_elevation': 'first'
-        # }).sort_values('dist_along_line')
+        """Plot the ground surface profile (single surface or most recent)."""
+        if len(self.elevation_plot) > 0 and len(self.elevation_dist_along_line) > 0:
+            ax.plot(
+                self.elevation_dist_along_line,
+                self.elevation_plot,
+                color="saddlebrown",
+                linewidth=2,
+                linestyle="-",
+                alpha=0.7,
+                label="Ground Surface",
+            )
 
-        # ax.plot(station_data['dist_along_line'],
-        #        station_data['ground_elevation'],
-        #        color='saddlebrown', linewidth=2,
-        #        linestyle='-', alpha=0.7, label='Ground Surface')
+    def _plot_all_ground_surfaces(self, ax):
+        """Plot all dated ground surface profiles."""
+        if not self.ground_surfaces:
+            self._plot_ground_surface(ax)
+            return
 
-        # print(self.elevation_plot, self.elevation_dist_along_line)
-        # alternative plotting of sampled data along line=================================================
-        ax.plot(
-            self.elevation_dist_along_line,
-            self.elevation_plot,
-            color="saddlebrown",
-            linewidth=2,
-            linestyle="-",
-            alpha=0.7,
-            label="Ground Surface",
-        )
+        # Color scheme for different years
+        colors = plt.cm.viridis(np.linspace(0, 1, len(self.ground_surfaces)))
+
+        for idx, (year, surface_data) in enumerate(
+            sorted(self.ground_surfaces.items())
+        ):
+            ax.plot(
+                surface_data["distance"],
+                surface_data["elevation"],
+                color=colors[idx],
+                linewidth=2,
+                linestyle="-",
+                alpha=0.7,
+                label=f"Ground Surface {year}",
+            )
+
+        print(f"Plotted {len(self.ground_surfaces)} ground surface profiles")
 
     def plot_map_view(
         self,
