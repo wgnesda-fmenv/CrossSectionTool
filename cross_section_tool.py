@@ -616,12 +616,123 @@ class CrossSectionTool:
             with rasterio.open(path_to_use) as src:
                 coord_list = [(x, y) for x, y in zip(x_coords, y_coords)]
                 elevations = [val[0] for val in src.sample(coord_list)]
-                return np.array(elevations)
+                elevations = np.array(elevations)
+
+                # Get NoData value from raster metadata
+                nodata_value = src.nodata
+
+                # Replace NoData values with NaN
+                if nodata_value is not None:
+                    elevations = np.where(
+                        elevations == nodata_value, np.nan, elevations
+                    )
+
+                # Also handle common NoData sentinels
+                elevations = np.where(elevations <= -9999, np.nan, elevations)
+
+                return elevations
         except Exception as e:
             warnings.warn(
                 f"Error reading DEM {path_to_use}: {e}. Using reference elevation."
             )
             return np.full(len(x_coords), self.reference_elevation)
+
+    def generate_ground_surfaces(
+        self,
+        sample_num: int = 200,
+        years: Optional[List[int]] = None,
+        use_all_files: bool = False,
+    ):
+        """
+        Create continuous ground-surface profiles by sampling each bathymetry raster
+        along the current cross-section line.
+
+        Call this after build_cross_section() to populate self.ground_surfaces for
+        use with plot_all_ground_surfaces=True.
+
+        Parameters:
+        -----------
+        sample_num : int
+            Number of points to sample along the cross-section line (default: 200)
+        years : list of int, optional
+            Specific years to create profiles for. If None, uses years from xsec_data
+        use_all_files : bool
+            If True, create profiles for all discovered bathymetry files.
+            If False (default), only create profiles for years matched to samples
+
+        Example:
+        --------
+        >>> xsec.build_cross_section(search_distance=200)
+        >>> xsec.generate_ground_surfaces(sample_num=300, use_all_files=False)
+        >>> xsec.plot_cross_section(plot_all_ground_surfaces=True)
+        """
+        if not RASTERIO_AVAILABLE:
+            warnings.warn("rasterio not available; cannot sample bathymetry rasters.")
+            return
+
+        if not hasattr(self, "xsec_line") or self.xsec_line is None:
+            raise RuntimeError(
+                "Cross-section line not set. Call set_line_programmatic() or set_line_interactive() first."
+            )
+
+        # Ensure container exists
+        if not hasattr(self, "ground_surfaces") or self.ground_surfaces is None:
+            self.ground_surfaces = {}
+
+        # Decide which years to create profiles for
+        available_years = sorted(
+            [int(y) for y in getattr(self, "bathy_files", {}).keys()]
+        )
+
+        if years is None:
+            if use_all_files:
+                years_to_build = available_years
+            else:
+                # Take years matched to samples (if present)
+                years_col = getattr(self, "xsec_data", pd.DataFrame()).get("bathy_year")
+                if years_col is None or years_col.dropna().empty:
+                    years_to_build = []
+                else:
+                    years_to_build = sorted(int(y) for y in years_col.dropna().unique())
+        else:
+            years_to_build = [int(y) for y in years if int(y) in available_years]
+
+        if not years_to_build:
+            print("No bathymetry years to build profiles for.")
+            return
+
+        # Sample coordinates along the line
+        length = self.xsec_line.length
+        distances_along = np.linspace(0.0, length, sample_num)
+        points = [self.xsec_line.interpolate(d) for d in distances_along]
+        xs = np.array([p.x for p in points])
+        ys = np.array([p.y for p in points])
+
+        # Sample each requested bathy raster
+        for year in sorted(years_to_build):
+            bathy_path = self.bathy_files.get(int(year))
+            if bathy_path is None:
+                continue
+            try:
+                elev = self._sample_dem(xs, ys, dem_path=bathy_path)
+                # Store profile keyed by year (int)
+                self.ground_surfaces[int(year)] = {
+                    "distance": distances_along,
+                    "elevation": np.array(elev),
+                }
+                print(f"Created ground surface profile for year {year}")
+            except Exception as e:
+                warnings.warn(
+                    f"Failed to sample bathymetry for year {year} ({bathy_path}): {e}"
+                )
+
+        # Set default plotting profile to most recent year (if any)
+        if self.ground_surfaces:
+            most_recent = max(self.ground_surfaces.keys())
+            prof = self.ground_surfaces[most_recent]
+            self.elevation_plot = prof["elevation"]
+            self.elevation_dist_along_line = prof["distance"]
+            print(f"Set default profile to year {most_recent}")
 
     def plot_cross_section(
         self,
@@ -632,6 +743,7 @@ class CrossSectionTool:
         plot_ground_surface: bool = True,
         plot_all_ground_surfaces: bool = False,
         ylabel: str = "Elevation",
+        depth_ylabel: str = "Depth (units)",
         title: Optional[str] = None,
         savepath: Optional[str] = None,
         dpi: int = 300,
@@ -660,7 +772,9 @@ class CrossSectionTool:
             If True and multiple dated bathymetry surfaces exist, plot all of them.
             If False, only plot the most recent one (default: False)
         ylabel : str
-            Y-axis label
+            Y-axis label for elevation plot
+        depth_ylabel : str
+            Y-axis label for depth subplot (default: "Depth (units)")
         title : str, optional
             Plot title
         savepath : str, optional
@@ -697,13 +811,24 @@ class CrossSectionTool:
         self._value_bins = sorted(value_bins) if value_bins else None
         self._value_colors = value_colors
 
-        fig, ax = plt.subplots(figsize=figsize)
-
         # Determine if we have interval or point data
         has_intervals = (
             self.columns["top_depth"] in self.xsec_data.columns
             and self.columns["bottom_depth"] in self.xsec_data.columns
         )
+
+        # Create subplots: 2 rows if using value-based coloring with intervals, 1 otherwise
+        if color_by == "value" and has_intervals:
+            fig, (ax, ax_depth) = plt.subplots(
+                2,
+                1,
+                figsize=(figsize[0], figsize[1] * 1.5),
+                sharex=True,
+                gridspec_kw={"height_ratios": [2, 1]},
+            )
+        else:
+            fig, ax = plt.subplots(figsize=figsize)
+            ax_depth = None
 
         # Calculate bar width if not provided
         if bar_width is None:
@@ -727,6 +852,33 @@ class CrossSectionTool:
             }
             print(color_scheme)  # debugging
 
+        # Align bars with ground surface line if profiles exist
+        # Interpolate ground elevation from the profile at each sample's position
+        if self.ground_surfaces and has_intervals:
+            # Use the most recent year's profile for interpolation
+            most_recent_year = max(self.ground_surfaces.keys())
+            profile = self.ground_surfaces[most_recent_year]
+
+            # Create a working copy to avoid modifying original data
+            plot_data = self.xsec_data.copy()
+
+            # Interpolate ground elevation at each sample's distance along line
+            interpolated_elevations = np.interp(
+                plot_data["dist_along_line"], profile["distance"], profile["elevation"]
+            )
+
+            # Recalculate elevations using interpolated ground surface
+            plot_data["top_elevation"] = (
+                interpolated_elevations - plot_data[self.columns["top_depth"]]
+            )
+            plot_data["bottom_elevation"] = (
+                interpolated_elevations - plot_data[self.columns["bottom_depth"]]
+            )
+
+            # Temporarily replace xsec_data for plotting
+            original_xsec_data = self.xsec_data
+            self.xsec_data = plot_data
+
         # Plot lithologic intervals or points
         if has_intervals:
             self._plot_intervals(ax, color_scheme, bar_width)
@@ -740,8 +892,15 @@ class CrossSectionTool:
             else:
                 self._plot_ground_surface(ax)
 
+        # Restore original xsec_data if we modified it for alignment
+        if self.ground_surfaces and has_intervals and "original_xsec_data" in locals():
+            self.xsec_data = original_xsec_data
+
         # Formatting
-        ax.set_xlabel("Distance Along Section (units)", fontsize=11)
+        if ax_depth is None:
+            # Single plot - add xlabel to main axis
+            ax.set_xlabel("Distance Along Section (units)", fontsize=11)
+        # If dual plots, xlabel will be added to bottom plot
         ax.set_ylabel(ylabel, fontsize=11)
         ax.grid(True, alpha=0.3, axis="y")
 
@@ -773,32 +932,212 @@ class CrossSectionTool:
 
         # Set y-limits with some padding
         if y_values:
-            y_min = np.min(y_values)
-            y_max = np.max(y_values)
-            y_range = y_max - y_min if y_max != y_min else 10
-            ax.set_ylim(y_min - 0.05 * y_range, y_max + 0.05 * y_range)
+            # Filter out NaN and invalid values
+            y_values_clean = [v for v in y_values if not np.isnan(v) and v > -9999]
+            if y_values_clean:
+                y_min = np.min(y_values_clean)
+                y_max = np.max(y_values_clean)
+                y_range = y_max - y_min if y_max != y_min else 10
+                ax.set_ylim(y_min - 0.05 * y_range, y_max + 0.05 * y_range)
+
+        # Plot depth subplot if using value-based coloring with intervals
+        if ax_depth is not None:
+            self._plot_intervals_depth(ax_depth, bar_width)
+            ax_depth.set_xlabel("Distance Along Section (units)", fontsize=11)
+            ax_depth.set_ylabel(depth_ylabel, fontsize=11)
+            ax_depth.grid(True, alpha=0.3, axis="y")
+            ax_depth.set_xlim(0, self.xsec_line.length)
+            ax_depth.invert_yaxis()  # Depth increases downward
+
+            # Set depth limits based on original depth values
+            depth_values = []
+            depth_values.extend(self.xsec_data[self.columns["top_depth"]].values)
+            depth_values.extend(self.xsec_data[self.columns["bottom_depth"]].values)
+            if depth_values:
+                depth_min = np.min(depth_values)
+                depth_max = np.max(depth_values)
+                depth_range = depth_max - depth_min if depth_max != depth_min else 1
+                ax_depth.set_ylim(
+                    depth_max + 0.05 * depth_range, depth_min - 0.05 * depth_range
+                )
 
         # Add legend
-        handles = [
-            plt.Rectangle(
-                (0, 0),
-                1,
-                1,
-                facecolor=color_scheme.get(desc, "gray"),
-                edgecolor="black",
-                linewidth=0.5,
+        if color_scheme is not None and len(color_scheme) > 0:
+            handles = [
+                plt.Rectangle(
+                    (0, 0),
+                    1,
+                    1,
+                    facecolor=color_scheme.get(desc, "gray"),
+                    edgecolor="black",
+                    linewidth=0.5,
+                )
+                for desc in sorted(color_scheme.keys())
+            ]
+            labels = sorted(color_scheme.keys())
+
+            # Add ground surface to legend if plotted
+            if plot_ground_surface:
+                from matplotlib.lines import Line2D
+
+                if plot_all_ground_surfaces and self.ground_surfaces:
+                    # Add all ground surface profiles
+                    colors_gs = plt.cm.viridis(
+                        np.linspace(0, 1, len(self.ground_surfaces))
+                    )
+                    for idx, year in enumerate(sorted(self.ground_surfaces.keys())):
+                        handles.append(
+                            Line2D(
+                                [0], [0], color=colors_gs[idx], linewidth=2, alpha=0.7
+                            )
+                        )
+                        labels.append(f"Ground Surface {year}")
+                elif len(self.elevation_plot) > 0:
+                    # Add single ground surface
+                    handles.append(
+                        Line2D([0], [0], color="saddlebrown", linewidth=2, alpha=0.7)
+                    )
+                    labels.append("Ground Surface")
+
+            ax.legend(
+                handles,
+                labels,
+                loc="best",
+                ncol=min(3, len(labels)),
+                fontsize=9,
+                title="Lithology",
             )
-            for desc in sorted(color_scheme.keys())
-        ]
-        labels = sorted(color_scheme.keys())
-        ax.legend(
-            handles,
-            labels,
-            loc="best",
-            ncol=min(3, len(labels)),
-            fontsize=9,
-            title="Lithology",
-        )
+        elif color_by == "value":
+            # Create legend for value-based coloring
+            if self._value_bins and self._value_colors:
+                # Multi-range legend
+                handles = []
+                labels = []
+                bins = self._value_bins
+                colors = self._value_colors
+
+                # First range: -inf to first bin
+                handles.append(
+                    plt.Rectangle(
+                        (0, 0),
+                        1,
+                        1,
+                        facecolor=colors[0],
+                        edgecolor="black",
+                        linewidth=0.5,
+                    )
+                )
+                labels.append(f"≤ {bins[0]}")
+
+                # Middle ranges
+                for i in range(len(bins) - 1):
+                    handles.append(
+                        plt.Rectangle(
+                            (0, 0),
+                            1,
+                            1,
+                            facecolor=colors[i + 1],
+                            edgecolor="black",
+                            linewidth=0.5,
+                        )
+                    )
+                    labels.append(f"{bins[i]} - {bins[i+1]}")
+
+                # Last range: last bin to +inf
+                handles.append(
+                    plt.Rectangle(
+                        (0, 0),
+                        1,
+                        1,
+                        facecolor=colors[-1],
+                        edgecolor="black",
+                        linewidth=0.5,
+                    )
+                )
+                labels.append(f"> {bins[-1]}")
+
+                # Add ground surface to legend if plotted
+                if plot_ground_surface:
+                    from matplotlib.lines import Line2D
+
+                    if plot_all_ground_surfaces and self.ground_surfaces:
+                        # Add all ground surface profiles
+                        colors_gs = plt.cm.viridis(
+                            np.linspace(0, 1, len(self.ground_surfaces))
+                        )
+                        for idx, year in enumerate(sorted(self.ground_surfaces.keys())):
+                            handles.append(
+                                Line2D(
+                                    [0],
+                                    [0],
+                                    color=colors_gs[idx],
+                                    linewidth=2,
+                                    alpha=0.7,
+                                )
+                            )
+                            labels.append(f"Ground Surface {year}")
+                    elif len(self.elevation_plot) > 0:
+                        # Add single ground surface
+                        handles.append(
+                            Line2D(
+                                [0], [0], color="saddlebrown", linewidth=2, alpha=0.7
+                            )
+                        )
+                        labels.append("Ground Surface")
+
+                ax.legend(
+                    handles, labels, loc="best", ncol=1, fontsize=9, title="Value Range"
+                )
+            else:
+                # Binary threshold legend
+                thresh = self._value_threshold
+                handles = [
+                    plt.Rectangle(
+                        (0, 0),
+                        1,
+                        1,
+                        facecolor="green",
+                        edgecolor="black",
+                        linewidth=0.5,
+                    ),
+                    plt.Rectangle(
+                        (0, 0), 1, 1, facecolor="red", edgecolor="black", linewidth=0.5
+                    ),
+                ]
+                labels = [f"≤ {thresh}", f"> {thresh}"]
+
+                # Add ground surface to legend if plotted
+                if plot_ground_surface:
+                    from matplotlib.lines import Line2D
+
+                    if plot_all_ground_surfaces and self.ground_surfaces:
+                        # Add all ground surface profiles
+                        colors_gs = plt.cm.viridis(
+                            np.linspace(0, 1, len(self.ground_surfaces))
+                        )
+                        for idx, year in enumerate(sorted(self.ground_surfaces.keys())):
+                            handles.append(
+                                Line2D(
+                                    [0],
+                                    [0],
+                                    color=colors_gs[idx],
+                                    linewidth=2,
+                                    alpha=0.7,
+                                )
+                            )
+                            labels.append(f"Ground Surface {year}")
+                    elif len(self.elevation_plot) > 0:
+                        # Add single ground surface
+                        handles.append(
+                            Line2D(
+                                [0], [0], color="saddlebrown", linewidth=2, alpha=0.7
+                            )
+                        )
+                        labels.append("Ground Surface")
+
+                ax.legend(
+                    handles, labels, loc="best", ncol=1, fontsize=9, title="Value Range"
+                )
 
         plt.tight_layout()
 
@@ -881,6 +1220,37 @@ class CrossSectionTool:
 
                 rect = Rectangle(
                     (x_pos - bar_width / 2, bottom),
+                    bar_width,
+                    height,
+                    facecolor=color,
+                    edgecolor="black",
+                    linewidth=0.5,
+                )
+                ax.add_patch(rect)
+
+    def _plot_intervals_depth(self, ax, bar_width):
+        """Plot lithologic intervals using original depth values (not elevation-corrected)."""
+        for station_id in self.xsec_data[self.columns["station_id"]].unique():
+            station_data = self.xsec_data[
+                self.xsec_data[self.columns["station_id"]] == station_id
+            ]
+            x_pos = station_data["dist_along_line"].iloc[0]
+
+            for _, row in station_data.iterrows():
+                # Determine color using value
+                if self.columns.get("value") in row.index:
+                    val = row.get(self.columns["value"], None)
+                    color = self._get_color_for_value(val)
+                else:
+                    color = "lightgray"
+
+                # Use original depth values (not elevation-corrected)
+                top = row[self.columns["top_depth"]]
+                bottom = row[self.columns["bottom_depth"]]
+                height = bottom - top  # depth increases downward
+
+                rect = Rectangle(
+                    (x_pos - bar_width / 2, top),
                     bar_width,
                     height,
                     facecolor=color,

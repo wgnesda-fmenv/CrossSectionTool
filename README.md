@@ -139,6 +139,9 @@ xsec.build_cross_section(
     sample_num=100  # Points to sample along line for ground surface
 )
 
+# Generate continuous ground surface profiles for matched years
+xsec.generate_ground_surfaces(sample_num=200)
+
 # Plot with single surface (most recent year)
 fig1 = xsec.plot_cross_section(plot_all_ground_surfaces=False)
 
@@ -395,6 +398,26 @@ Project data onto cross-section line.
 **Returns:** pd.DataFrame with cross-section data
 
 **Note:** If `bathy_folder` was provided during initialization, the tool uses dated bathymetry matching instead of a single DEM.
+
+##### generate_ground_surfaces()
+```python
+xsec.generate_ground_surfaces(sample_num=200, years=None, use_all_files=False)
+```
+Create continuous ground-surface profiles by sampling bathymetry rasters along the cross-section line.
+
+**Important:** Call this after `build_cross_section()` to populate profiles for `plot_all_ground_surfaces=True`.
+
+**Parameters:**
+- `sample_num` (int): Number of points to sample along line (default: 200)
+- `years` (list of int, optional): Specific years to create profiles for. If None, uses years matched to samples
+- `use_all_files` (bool): If True, create profiles for all bathymetry files. If False (default), only for matched years
+
+**Example:**
+```python
+xsec.build_cross_section(search_distance=100)
+xsec.generate_ground_surfaces(sample_num=300, use_all_files=False)
+xsec.plot_cross_section(plot_all_ground_surfaces=True)
+```
 
 ##### plot_cross_section()
 ```python
