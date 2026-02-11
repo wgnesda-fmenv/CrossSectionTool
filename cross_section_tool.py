@@ -635,6 +635,10 @@ class CrossSectionTool:
         title: Optional[str] = None,
         savepath: Optional[str] = None,
         dpi: int = 300,
+        color_by: Optional[str] = None,
+        value_threshold: Optional[float] = None,
+        value_bins: Optional[List[float]] = None,
+        value_colors: Optional[List[str]] = None,
     ) -> plt.Figure:
         """
         Plot the cross-section.
@@ -663,6 +667,17 @@ class CrossSectionTool:
             Path to save the figure
         dpi : int
             Resolution for saved figure
+        color_by : str, optional
+            'description' (default) or 'value' - determines coloring mode
+        value_threshold : float, optional
+            Simple binary threshold for value-based coloring (default: 1000)
+            Values > threshold = red, values <= threshold = green
+        value_bins : list of float, optional
+            List of ascending thresholds for multi-range value coloring
+            Example: [500, 1000, 2000] creates ranges: (-inf,500], (500,1000], (1000,2000], (2000,inf)
+        value_colors : list of str, optional
+            Colors for each range (length must equal len(value_bins) + 1)
+            Example: ['blue', 'green', 'orange', 'red'] for 3 bins
 
         Returns:
         --------
@@ -673,6 +688,14 @@ class CrossSectionTool:
             raise ValueError(
                 "No cross-section data available. Run build_cross_section() first"
             )
+
+        # Store value-based coloring parameters for helper methods
+        self._color_by = color_by
+        self._value_threshold = (
+            value_threshold if value_threshold is not None else 1000.0
+        )
+        self._value_bins = sorted(value_bins) if value_bins else None
+        self._value_colors = value_colors
 
         fig, ax = plt.subplots(figsize=figsize)
 
@@ -695,8 +718,8 @@ class CrossSectionTool:
             else:
                 bar_width = self.xsec_line.length * 0.05
 
-        # Set up default color scheme if not provided
-        if color_scheme is None:
+        # Set up default color scheme if not provided (skip if using pure value-based coloring)
+        if color_scheme is None and color_by != "value":
             unique_descriptions = self.xsec_data[self.columns["description"]].unique()
             colors = plt.cm.tab20(np.linspace(0, 1, len(unique_descriptions)))
             color_scheme = {
@@ -785,6 +808,48 @@ class CrossSectionTool:
 
         return fig
 
+    def _get_color_for_value(self, val, default="lightgray"):
+        """
+        Return color string for numeric value based on bins/colors or threshold.
+
+        Parameters:
+        -----------
+        val : float
+            The numeric value to color
+        default : str
+            Default color for missing/NaN values
+
+        Returns:
+        --------
+        str
+            Color string
+        """
+        # Handle None/NaN values
+        try:
+            if val is None or pd.isna(val):
+                return default
+        except Exception:
+            return default
+
+        # Bins-based mapping (preferred if specified)
+        if (
+            getattr(self, "_value_bins", None) is not None
+            and getattr(self, "_value_colors", None) is not None
+        ):
+            bins = self._value_bins
+            colors = self._value_colors
+            # Find index: number of bin thresholds less than value
+            idx = sum(val > b for b in bins)
+            # Safeguard: colors length should be len(bins)+1
+            if idx < len(colors):
+                return colors[idx]
+            else:
+                return colors[-1]
+
+        # Fallback: simple binary threshold
+        thresh = getattr(self, "_value_threshold", 1000.0)
+        return "red" if val > thresh else "green"
+
     def _plot_intervals(self, ax, color_scheme, bar_width):
         """Plot lithologic intervals as colored rectangles."""
         for station_id in self.xsec_data[self.columns["station_id"]].unique():
@@ -795,7 +860,20 @@ class CrossSectionTool:
 
             for _, row in station_data.iterrows():
                 desc = row[self.columns["description"]]
-                color = color_scheme.get(desc, "lightgray")
+
+                # Determine color: value-based or description-based
+                if (
+                    getattr(self, "_color_by", None) == "value"
+                    and self.columns.get("value") in row.index
+                ):
+                    val = row.get(self.columns["value"], None)
+                    color = self._get_color_for_value(val)
+                else:
+                    color = (
+                        color_scheme.get(desc, "lightgray")
+                        if color_scheme
+                        else "lightgray"
+                    )
 
                 top = row["top_elevation"]
                 bottom = row["bottom_elevation"]
@@ -815,9 +893,21 @@ class CrossSectionTool:
         """Plot point data as markers or short bars."""
         for _, row in self.xsec_data.iterrows():
             desc = row[self.columns["description"]]
-            color = color_scheme.get(desc, "lightgray")
+
+            # Determine color: value-based or description-based
+            if (
+                getattr(self, "_color_by", None) == "value"
+                and self.columns.get("value") in row.index
+            ):
+                val = row.get(self.columns["value"], None)
+                color = self._get_color_for_value(val)
+            else:
+                color = (
+                    color_scheme.get(desc, "lightgray") if color_scheme else "lightgray"
+                )
+
             x_pos = row["dist_along_line"]
-            y_pos = row["elevation"]
+            y_pos = row.get("elevation", row.get("top_elevation", None))
 
             # Plot as a small marker
             ax.scatter(

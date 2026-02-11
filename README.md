@@ -10,6 +10,7 @@ A comprehensive Python tool for creating geological cross-sections from borehole
 - ✅ **Dated Bathymetry**: Match cores to nearest-year bathymetry from a folder of dated rasters
 - ✅ **DEM Integration**: Sample ground surface elevations from single or multiple dated DEM rasters
 - ✅ **Multiple Ground Surfaces**: Plot multiple dated bathymetry surfaces on same cross-section
+- ✅ **Value-Based Coloring**: Color intervals by numeric values with customizable thresholds
 - ✅ **Customizable Visualization**: Full control over colors, widths, and styling
 - ✅ **Data Export**: Export cross-section data to CSV, Excel, or Shapefiles
 - ✅ **Map View**: Generate accompanying map views showing section location
@@ -178,6 +179,50 @@ color_scheme = {
 fig = xsec.plot_cross_section(color_scheme=color_scheme)
 ```
 
+### Value-Based Coloring (NEW!)
+
+Color intervals by numeric values instead of descriptions. Perfect for contamination levels, concentrations, or any numeric data.
+
+#### Simple Binary Threshold
+
+```python
+# Color by a single threshold: values > 1000 = red, values <= 1000 = green
+fig = xsec.plot_cross_section(
+    color_by='value',
+    value_threshold=1000
+)
+```
+
+#### Multiple Thresholds (Range-Based Coloring)
+
+```python
+# Define multiple ranges with custom colors
+# Ranges: (-∞, 500], (500, 1000], (1000, 2000], (2000, +∞)
+fig = xsec.plot_cross_section(
+    color_by='value',
+    value_bins=[500, 1000, 2000],
+    value_colors=['blue', 'green', 'orange', 'red']
+)
+```
+
+#### Contamination Example
+
+```python
+# Classify contamination levels
+fig = xsec.plot_cross_section(
+    color_by='value',
+    value_bins=[10, 50, 100],  # Clean, Low, Medium, High
+    value_colors=['green', 'yellow', 'orange', 'red'],
+    title='Contamination Levels (mg/kg)'
+)
+```
+
+**Important Notes:**
+- Your data must have a `Value` column (or specify in `column_mapping`)
+- `value_colors` length must equal `len(value_bins) + 1`
+- Missing/NaN values default to light gray
+- Works with both interval and point data
+
 ### Quick One-Liner
 
 ```python
@@ -205,15 +250,18 @@ Your DataFrame should contain these columns (customizable via `column_mapping`):
 | Bottom_Depth | Bottom depth of interval | 10.5 |
 | Description | Lithologic description | Sand |
 | SampleDate | Sample date (for bathymetry matching) | 2015-06-20 |
+| Value | Numeric value (for value-based coloring) | 850.5 |
 
-**Note:** SampleDate is optional. Required only when using dated bathymetry rasters.
+**Notes:** 
+- `SampleDate` is optional - required only when using dated bathymetry rasters
+- `Value` is optional - required only when using value-based coloring (`color_by='value'`)
 
 **Example CSV:**
 ```csv
-StationID,X_Coord,Y_Coord,Top_Depth,Bottom_Depth,Description,SampleDate
-BH-001,100,200,0,5,Sand,2015-06-20
-BH-001,100,200,5,15,Clay,2015-06-20
-BH-002,150,250,0,10,Gravel,2018-08-15
+StationID,X_Coord,Y_Coord,Top_Depth,Bottom_Depth,Description,SampleDate,Value
+BH-001,100,200,0,5,Sand,2015-06-20,450
+BH-001,100,200,5,15,Clay,2015-06-20,1200
+BH-002,150,250,0,10,Gravel,2018-08-15,75
 ```
 
 ### Point Data
@@ -227,7 +275,7 @@ For point measurements (e.g., water levels):
 | Y_Coord | Y or Northing coordinate | 5678.90 |
 | Depth | Depth of measurement | 25.3 |
 | Description | Description | Water Level |
-| Value | Optional numeric value | 15.2 |
+| Value | Numeric value (for value-based coloring or data) | 15.2 |
 | SampleDate | Sample date (optional, for bathymetry) | 2020-03-15 |
 
 ### GeoDataFrame Input
@@ -353,13 +401,27 @@ Project data onto cross-section line.
 fig = xsec.plot_cross_section(color_scheme=None, figsize=(14, 6),
                                vertical_exaggeration=1.0, bar_width=None,
                                plot_ground_surface=True, plot_all_ground_surfaces=False,
-                               ylabel='Elevation', title=None, savepath=None, dpi=300)
+                               ylabel='Elevation', title=None, savepath=None, dpi=300,
+                               color_by=None, value_threshold=None, 
+                               value_bins=None, value_colors=None)
 ```
 Generate cross-section plot.
 
 **Parameters:**
+- `color_scheme` (dict, optional): Mapping of descriptions to colors (ignored if color_by='value')
+- `figsize` (tuple): Figure size (width, height)
+- `vertical_exaggeration` (float): Vertical exaggeration factor
+- `bar_width` (float, optional): Width of bars (auto-calculated if None)
 - `plot_ground_surface` (bool): Whether to plot ground surface line
 - `plot_all_ground_surfaces` (bool): If True, plot all dated bathymetry surfaces (only when using bathy_folder)
+- `ylabel` (str): Y-axis label
+- `title` (str, optional): Plot title
+- `savepath` (str, optional): Path to save figure
+- `dpi` (int): Resolution for saved figure
+- `color_by` (str, optional): 'description' (default) or 'value' - coloring mode
+- `value_threshold` (float, optional): Binary threshold for value coloring (default: 1000)
+- `value_bins` (list of float, optional): Thresholds for multi-range value coloring
+- `value_colors` (list of str, optional): Colors for each range (length = len(value_bins) + 1)
 
 ##### plot_map_view()
 ```python
