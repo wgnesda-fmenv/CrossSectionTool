@@ -751,6 +751,10 @@ class CrossSectionTool:
         value_threshold: Optional[float] = None,
         value_bins: Optional[List[float]] = None,
         value_colors: Optional[List[str]] = None,
+        show_station_ids: bool = False,
+        show_sample_dates: bool = False,
+        show_bathy_years: bool = False,
+        annotation_fontsize: int = 7,
     ) -> plt.Figure:
         """
         Plot the cross-section.
@@ -792,6 +796,14 @@ class CrossSectionTool:
         value_colors : list of str, optional
             Colors for each range (length must equal len(value_bins) + 1)
             Example: ['blue', 'green', 'orange', 'red'] for 3 bins
+        show_station_ids : bool
+            If True, display station IDs above each core/station (default: False)
+        show_sample_dates : bool
+            If True, display sample dates above each core/station (default: False)
+        show_bathy_years : bool
+            If True, display the matched bathymetry year for each station (default: False)
+        annotation_fontsize : int
+            Font size for station labels (default: 7)
 
         Returns:
         --------
@@ -960,6 +972,16 @@ class CrossSectionTool:
                 ax_depth.set_ylim(
                     depth_max + 0.05 * depth_range, depth_min - 0.05 * depth_range
                 )
+
+        # Add station annotations if requested
+        if show_station_ids or show_sample_dates or show_bathy_years:
+            self._add_station_annotations(
+                ax,
+                show_station_ids,
+                show_sample_dates,
+                show_bathy_years,
+                annotation_fontsize,
+            )
 
         # Add legend
         if color_scheme is not None and len(color_scheme) > 0:
@@ -1326,6 +1348,79 @@ class CrossSectionTool:
             )
 
         print(f"Plotted {len(self.ground_surfaces)} ground surface profiles")
+
+    def _add_station_annotations(
+        self,
+        ax,
+        show_station_ids: bool,
+        show_sample_dates: bool,
+        show_bathy_years: bool,
+        fontsize: int,
+    ):
+        """Add text annotations for station IDs, sample dates, and/or bathymetry years."""
+        # Group by station to avoid duplicate labels
+        for station_id in self.xsec_data[self.columns["station_id"]].unique():
+            station_data = self.xsec_data[
+                self.xsec_data[self.columns["station_id"]] == station_id
+            ]
+
+            # Get the position along the line (use first occurrence)
+            dist_along = station_data["dist_along_line"].iloc[0]
+
+            # Get the highest elevation for this station to place label above it
+            if "ground_elevation" in station_data.columns:
+                y_position = station_data["ground_elevation"].iloc[0]
+            elif "plot_elevation" in station_data.columns:
+                y_position = station_data["plot_elevation"].max()
+            else:
+                # Fallback: use the minimum depth (highest point)
+                if self.columns["top_depth"] in station_data.columns:
+                    y_position = -station_data[self.columns["top_depth"]].min()
+                else:
+                    y_position = 0
+
+            # Build annotation text
+            label_parts = []
+
+            if show_station_ids:
+                label_parts.append(f"{station_id}")
+
+            if (
+                show_sample_dates
+                and self.columns["sample_date"] in station_data.columns
+            ):
+                sample_date = station_data[self.columns["sample_date"]].iloc[0]
+                if pd.notna(sample_date):
+                    # Format date nicely if it's a datetime
+                    if isinstance(sample_date, (pd.Timestamp, datetime)):
+                        date_str = sample_date.strftime("%Y-%m-%d")
+                    else:
+                        date_str = str(sample_date)
+                    label_parts.append(date_str)
+
+            if show_bathy_years and "bathy_year" in station_data.columns:
+                bathy_year = station_data["bathy_year"].iloc[0]
+                if pd.notna(bathy_year):
+                    label_parts.append(f"Bathy: {int(bathy_year)}")
+
+            if label_parts:
+                label_text = "\n".join(label_parts)
+                ax.annotate(
+                    label_text,
+                    xy=(dist_along, y_position),
+                    xytext=(0, 5),  # Offset 5 points above
+                    textcoords="offset points",
+                    fontsize=fontsize,
+                    ha="center",
+                    va="bottom",
+                    bbox=dict(
+                        boxstyle="round,pad=0.3",
+                        facecolor="white",
+                        edgecolor="gray",
+                        alpha=0.7,
+                    ),
+                    rotation=90,
+                )
 
     def plot_map_view(
         self,
